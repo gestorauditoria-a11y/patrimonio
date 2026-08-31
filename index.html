@@ -365,35 +365,63 @@ function loadSettings(){
 function persistSettings(){localStorage.setItem('niloTransferSettings',JSON.stringify(settings))}
 function toast(msg,error=false){const t=$('toast');t.textContent=msg;t.className='toast show'+(error?' error':'');clearTimeout(t._timer);t._timer=setTimeout(()=>t.className='toast',3000)}
 function apiBaseUrl(){
-  return String(window.NILO_PATRIMONIO_API_URL||'').trim();
+  return 'https://script.google.com/macros/s/AKfycbwT7q_vGo5hvG-YhXQuEw5i_xMEYkHn5_shr0i_xy_H52RD9Qp1-DW92OMNXvBcy_UHTg/exec';
 }
 function apiConfigured(){
   const u=apiBaseUrl();
-  return !!u && !/COLE_AQUI|SEU_WEB_APP/i.test(u);
+  return !!u && /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec/.test(u);
 }
-async function apiRead(action,params={}){
-  if(!apiConfigured()) throw new Error('API do Google Apps Script não configurada. Edite o arquivo config.js.');
-  const q=new URLSearchParams({action,...params,_:Date.now().toString()});
-  const r=await fetch(apiBaseUrl()+'?'+q.toString(),{method:'GET',cache:'no-store',redirect:'follow'});
-  const txt=await r.text();
-  let data;
-  try{data=JSON.parse(txt)}catch(e){throw new Error('Resposta inválida da API: '+txt.slice(0,180))}
-  if(!r.ok||!data.ok)throw new Error(data?.error||('Falha HTTP '+r.status));
-  return data;
-}
-async function apiWrite(action,payload={}){
-  if(!apiConfigured()) throw new Error('API do Google Apps Script não configurada. Edite o arquivo config.js.');
-  const r=await fetch(apiBaseUrl(),{
-    method:'POST',
-    headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body:JSON.stringify({action,...payload}),
-    redirect:'follow'
+function apiRead(action,params={},timeoutMs=25000){
+  if(!apiConfigured()) return Promise.reject(new Error('URL do Google Apps Script não configurada.'));
+  return new Promise((resolve,reject)=>{
+    const cb='niloJsonp_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+    const q=new URLSearchParams({action,...params,prefix:cb,_:Date.now().toString()});
+    const script=document.createElement('script');
+    let finished=false;
+    const cleanup=()=>{
+      if(finished)return;
+      finished=true;
+      clearTimeout(timer);
+      try{delete window[cb]}catch(e){window[cb]=undefined}
+      script.remove();
+    };
+    window[cb]=data=>{
+      cleanup();
+      if(!data||data.ok!==true) return reject(new Error(data?.error||'Falha na API do Google Sheets.'));
+      resolve(data);
+    };
+    script.onerror=()=>{
+      cleanup();
+      reject(new Error('Não foi possível acessar o Google Apps Script. Verifique a implantação pública /exec.'));
+    };
+    const timer=setTimeout(()=>{
+      cleanup();
+      reject(new Error('Tempo esgotado ao acessar a base Google Sheets.'));
+    },timeoutMs);
+    script.src=apiBaseUrl()+'?'+q.toString();
+    script.async=true;
+    document.head.appendChild(script);
   });
-  const txt=await r.text();
-  let data;
-  try{data=JSON.parse(txt)}catch(e){throw new Error('Resposta inválida da API: '+txt.slice(0,180))}
-  if(!r.ok||!data.ok)throw new Error(data?.error||('Falha HTTP '+r.status));
-  return data;
+}
+async function apiPostNoCors(action,payload={}){
+  if(!apiConfigured()) throw new Error('URL do Google Apps Script não configurada.');
+  await fetch(apiBaseUrl(),{
+    method:'POST',
+    mode:'no-cors',
+    cache:'no-store',
+    headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify({action,...payload})
+  });
+}
+async function waitUntil(check,timeoutMs=30000,intervalMs=900){
+  const start=Date.now();
+  let lastErr=null;
+  while(Date.now()-start<timeoutMs){
+    try{if(await check())return true}catch(e){lastErr=e}
+    await new Promise(r=>setTimeout(r,intervalMs));
+  }
+  if(lastErr)throw lastErr;
+  throw new Error('A gravação foi enviada, mas não foi confirmada pela base dentro do tempo esperado.');
 }
 async function openDB(){
   const h=await apiRead('health');
@@ -409,11 +437,21 @@ async function getOne(id){
   return d.transfer||null;
 }
 async function put(t){
-  await apiWrite('put',{transfer:t});
+  await apiPostNoCors('put',{transfer:t});
+  await waitUntil(async()=>{
+    const d=await apiRead('exists',{id:t.id});
+    if(!d.exists)return false;
+    if(t.updatedAt&&d.updatedAt)return String(d.updatedAt)===String(t.updatedAt);
+    return true;
+  });
   return t;
 }
 async function clearStore(){
-  await apiWrite('clear',{confirmation:'APAGAR'});
+  await apiPostNoCors('clear',{confirmation:'APAGAR'});
+  await waitUntil(async()=>{
+    const d=await apiRead('list');
+    return Array.isArray(d.transfers)&&d.transfers.length===0;
+  });
 }
 function logEvent(t,action,details=''){t.history=t.history||[];t.history.push({at:nowISO(),operator:settings.operator,action,details})}
 function statusBadge(s){let c='neutral';if(['Recebida'].includes(s))c='ok';else if(['Em trânsito','Recebimento parcial','Aguardando expedição'].includes(s))c='warn';else if(['Recebida com divergência','Cancelada'].includes(s))c='danger';else if(['Rascunho'].includes(s))c='info';return `<span class="badge ${c}">${esc(s)}</span>`}
@@ -896,6 +934,6 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){closeGlobalResults()}
 });
 
-(async function init(){await openDB();renderSettings();await renderAll()})().catch(e=>{console.error(e);toast('Falha ao conectar à base Google Sheets. Verifique config.js e a implantação do Apps Script.',true)})
+(async function init(){await openDB();renderSettings();await renderAll()})().catch(e=>{console.error(e);toast('Falha ao conectar à base Google Sheets. Atualize o Code.gs e publique uma nova implantação do Apps Script.',true)})
 </script>
 </body></html>
